@@ -1,30 +1,320 @@
 ---
 title: "Practical Machine Learning Course Project"
 author: "André van Zyl"
-date: "2/3/2020"
-output: html_document
+date: "1/18/2020"
+output:
+  html_document: default
+  word_document: default
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(DataExplorer)
+library(caret)
+library(knitr)
 ```
 
-## R Markdown
+# Background
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, the goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+The goal of this project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set. 
 
-```{r cars}
-summary(cars)
+This report describes how the model was built, how cross-validation was done, what the expected out of sample error is, and reasons for decisions made. The final prediction model will be used to predict 20 different test cases.
+
+# Data
+
+The training data for this project are available here: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+It takes a while to download the data. The following script will download the data and store it on the computer. Also, there are some variables ("", "#DIV/0!", "NA") that should be imported as R’s NA class. 
+
+```{r message=TRUE, warning=TRUE, include=FALSE}
+ifelse(file.exists("MLCourse.RData"),
+       load("MLCourse.RData"),
+       
+       {
+          train <-
+             read_csv(
+                "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                na = c("", "#DIV/0!", "NA")
+             )
+          predict <-
+             read_csv(
+                "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                na = c("", "#DIV/0!", "NA")
+             )
+          save(predict, train, file = "MLCourse.RData")
+       })
+
 ```
 
-## Including Plots
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har . The data can be cited as follows:
+> Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
 
-You can also embed plots, for example:
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+# Eplore
+
+It is essential to get an overview of the data before we can start. 
+
+## Outcome
+
+
+The outcome variable, classe, is a character variable. 
+
+```{r}
+class(train$classe)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+To make sure it works with our models and predictions,  it will convert it to a factor variable. 
+
+```{r}
+train$classe <- as.factor(train$classe)
+```
+
+The outcome variable has the following levels:
+
+* A: Exactly according to the specification
+
+* B: Throwing the elbows to the front
+
+* C: Lifting the dumbbell only halfway
+
+* D: Lowering the dumbbell only halfway 
+
+* E: Throwing the hips to the front
+
+
+```{r}
+train %>% ggplot(aes(classe, fill = classe)) + geom_bar()
+```
+
+"Exactly according to the specification (Class A)" occurs the most frequently and "Lowering the dumbbell only halfway (Class D)" the least. 
+
+Let us `introduce` the rest of the data with the `DataExplorer` package. 
+
+```{r}
+introduce(train) %>% kable(col.names = c("# Rows", "# Columns", "# Discrete columns", "# Continuous columns", "# All missing columns", "# Total missing values", "# Complete rows", "# Total observations", "# Memory usage" ), label = "Training data")
+```
+
+```{r}
+introduce(predict) %>% kable(col.names = c("# Rows", "# Columns", "# Discrete columns", "# Continuous columns", "# All missing columns", "# Total missing values", "# Complete rows", "# Total observations", "# Memory usage" ), label = "Testing data")
+```
+
+Generally, models require complete data sets. In this data,  there are not any complete cases. We will have to remove rows with all or many missing values.  
+
+# Variable removal(or selection)
+
+## Remove irrelevant varaibles
+
+The following variables cannot be used as features in the models:
+
+* X1: Row number
+
+* user_name: The person wearing the device
+
+* raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp: In this data, the time points can’t be used as a predicter.
+
+* num_window: Values unique to the person wearing the device. 
+
+```{r}
+Irrelevant <- c("X1", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "num_window")
+
+train <- select(train, -Irrelevant)
+```
+
+## Remove NA
+
+```{r}
+missing <- profile_missing(train) %>% filter(pct_missing > .9) %>% arrange(desc(pct_missing))
+```
+
+```{r}
+nrow(missing)
+```
+
+```{r}
+missing %>% head(10) %>% kable(col.names = c("Feature","Number Missing","% Missing"))
+```
+
+```{r}
+train <- train %>% select(-one_of(as.character(missing$feature)))
+```
+
+```{r}
+dim(train)
+```
+
+## Remove zero variance predictors
+
+```{r}
+nsv <- nearZeroVar(train, saveMetrics = TRUE)
+nsv_var <- nsv %>% rownames_to_column("var") %>% filter(nzv == TRUE) %>% select(var)
+nsv_var
+```
+
+```{r}
+train <- train %>% select(-one_of(nsv_var$var))
+dim(train)
+```
+
+
+# Process for building model
+
+## PreProcess
+
+I have added the preprocessing section to reduce the training time required during model building. Before doing this, I waited around an hour before I manually interrupted the training process. 
+
+First, I need to calculate the preprocessing values. 
+
+```{r}
+preProcValues  <- preProcess(
+  train %>% select(-"classe"),
+  method = c("center", # subtract mean from values.
+             "scale", # divide values by standard deviation.
+             "zv", # remove attributes with a zero variance (all the same value).
+             "nzv",# remove attributes with a near zero variance (close to the same value).
+             "pca"),# transform data to the principal components.
+  thresh = 0.50, # the cutoff for the cumulative percent of variance to be retained by PCA
+  pcaComp = NULL,
+  na.remove = TRUE,
+  k = 5,
+  knnSummary = mean,
+  outcome = NULL,
+  fudge = 0.2,
+  numUnique = 3,
+  verbose = FALSE,
+  freqCut = 95 / 5,
+  uniqueCut = 10,
+  cutoff = 0.9,
+  rangeBounds = c(0, 1)
+)
+
+```
+
+The preprocessing values can now be used to transform the initial training and prediction data. 
+
+```{r}
+train_transformed  <- predict(preProcValues, train %>% select(-"classe"))
+predict <- predict(preProcValues, predict)
+```
+
+During the PCA data transformation, I had to remove the outcome variable. Now, I am making sure to put it back. 
+
+```{r}
+train_transformed$classe <- train$classe
+```
+
+## Data used for prediction modelling
+
+Compare this table with the table that was generated on the original training data. 
+
+
+```{r}
+introduce(train_transformed) %>% kable(col.names = c("# Rows", "# Columns", "# Discrete columns", "# Continuous columns", "# All missing columns", "# Total missing values", "# Complete rows", "# Total observations", "# Memory usage" ))
+```
+
+## Training and testing split
+
+I divided the data into training and testing data. In addition to using the cross-validation features in the caret package, I am also confirming the accuracy by applying the model to the training data and generating a confusion matrix. 
+
+```{r}
+inTrain  <- createDataPartition(train_transformed$classe, p=0.7, list=FALSE)
+training <- train_transformed[inTrain, ]
+testing  <- train_transformed[-inTrain, ]
+dim(training)
+dim(testing)
+```
+
+
+
+## Model selection
+
+I have decided to predict variables with random forest ("ranger"), boosted trees ("gbm") and linear discriminant analysis ("lda") models considering that we already used these in a previous exercise. I will use the model with the lowest expected out of sample error (highest accuracy) to predict the 20 test cases. If the model with the highest accuracy fails the test on Coursera, I will consider other potential models or model tuning parameters. The model accuracy will be reported after each model’s training information. 
+
+### Cross-validation settings
+
+I’m first going to set up the number of folds (5) for cross-validation by defining the training control. These setting will be used in all my models to ensure consistency. 
+
+```{r}
+tr_ctrl <- trainControl(method="cv", number=5, verboseIter=FALSE)
+```
+
+### Random forrests
+
+#### Training 
+
+```{r include=FALSE}
+rfmodel <- train(classe~., data=training, method="ranger",
+                 trControl = tr_ctrl)
+
+rfmodel
+```
+
+#### Testing
+
+```{r}
+rfresult <- predict(rfmodel, testing)
+confusionMatrix(testing$classe , rfresult)$overall['Accuracy']
+```
+### Generalised Boosted Model
+
+#### Training 
+
+```{r include=FALSE}
+gbmmodel <- train(classe~., data=training, method="gbm",
+                 trControl = tr_ctrl)
+gbmmodel
+```
+
+#### Testing
+
+```{r}
+gbmresult <- predict(gbmmodel, testing)
+confusionMatrix(testing$classe, gbmresult)$overall['Accuracy']
+```
+
+### Latent Dirichlet allocation
+
+#### Training 
+
+```{r}
+ldamodel <- train(classe~., data=training, method="lda",
+                 trControl = trainControl(method="cv", number=3, verboseIter=FALSE))
+ldamodel
+```
+
+#### Testing
+
+```{r}
+ldaresult <- predict(ldamodel, testing)
+confusionMatrix(testing$classe, ldaresult)$overall['Accuracy']
+```
+
+
+# Prediction
+
+Finally, I’ve decided on using the random forest model to predict the 20 different test cases because it had the highest accuracy during validation. The test feedback on Coursera suggested this model is correct. 
+
+```{r}
+rf_predicion <- predict(rfmodel, newdata=predict)
+rf_predicion
+```
+
+
+The model could potentially be optimised even more. However, it seems to be fit for purpose. 
+
+Out of curiosity, I’ve compared the results of the other models too.
+
+```{r}
+gbm_predicion <- predict(gbmmodel, newdata=predict)
+gbm_predicion
+```
+
+```{r}
+lda_predicion <- predict(ldamodel, newdata=predict)
+lda_predicion
+```
+
